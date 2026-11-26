@@ -134,6 +134,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Download verified images
         uses: actions/download-artifact@v8
