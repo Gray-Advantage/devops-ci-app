@@ -176,3 +176,30 @@ jobs:
             docker buildx imagetools create --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}:${GITHUB_SHA}"
             docker buildx imagetools inspect "${IMAGE_NAME}:latest"
           fi
+
+  deploy:
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, devops-vm]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: deploy-devops-vm
+      cancel-in-progress: false
+    env:
+      VM_HOST: 127.0.0.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Deploy with Ansible
+        working-directory: ansible
+        run: |
+          ansible-playbook site.yml -e "ansible_host=$VM_HOST" -e "app_tag=$GITHUB_SHA"
+      - name: Check through Nginx
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-all-errors \
+            --max-time 10 "http://$VM_HOST/health" |
+            python3 -c 'import json, sys; body = json.load(sys.stdin); assert body["status"] == "ok", body; print(body)'
