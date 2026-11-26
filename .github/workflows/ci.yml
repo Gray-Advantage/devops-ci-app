@@ -1,0 +1,173 @@
+name: CI — verify and publish image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            app/requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r app/requirements.txt -r requirements-dev.txt
+      - name: Pylint
+        run: python -m pylint app --score=no
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            app/requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r app/requirements.txt -r requirements-dev.txt
+      - name: Unit tests
+        run: python -m pytest -q
+
+  image:
+    name: ${{ matrix.check }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: image
+            runner: ubuntu-latest
+            arch: amd64
+          - check: image-arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build image
+        run: |
+          image="devops-ci-app:${GITHUB_SHA}-${ARCH}"
+          docker build --platform "linux/${ARCH}" --tag "$image" .
+          platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")
+          printf 'Built platform: %s\n' "$platform"
+          test "$platform" = "linux/${ARCH}"
+      - name: Smoke-test container
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker logs smoke || true
+            docker rm -f smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --name smoke -p 127.0.0.1:5000:5000 "devops-ci-app:${GITHUB_SHA}-${ARCH}"
+          ready=0
+          for attempt in {1..15}; do
+            if curl --fail --silent --show-error --max-time 2 \
+              http://127.0.0.1:5000/health --output health.json; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo '::error::/health did not respond after 15 attempts'
+            exit 1
+          fi
+          python3 -m json.tool health.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("health.json").read_text(encoding="utf-8"))
+          assert payload == {"status": "ok"}, f"unexpected /health payload: {payload}"
+          PY
+          docker exec smoke id
+          test "$(docker exec smoke id -un)" = app
+          test "$(docker exec smoke id -u)" -ne 0
+      - name: Export verified image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: docker save "devops-ci-app:${GITHUB_SHA}-${ARCH}" | gzip -1 > "${ARCH}.tar.gz"
+      - name: Upload verified image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-main
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Download verified images
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-*
+          merge-multiple: true
+      - name: Normalize image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+      - name: Log in to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s\n' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Push architecture images
+        shell: bash
+        run: |
+          for arch in amd64 arm64; do
+            docker load --input "${arch}.tar.gz"
+            tag="${GITHUB_SHA}-${arch}"
+            docker tag "devops-ci-app:${tag}" "${IMAGE_NAME}:${tag}"
+            docker push "${IMAGE_NAME}:${tag}"
+          done
+      - name: Publish SHA and latest manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker buildx imagetools create --tag "${IMAGE_NAME}:${GITHUB_SHA}" \
+            "${IMAGE_NAME}:${GITHUB_SHA}-amd64" "${IMAGE_NAME}:${GITHUB_SHA}-arm64"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${GITHUB_SHA}"
+          docker buildx imagetools inspect --raw "${IMAGE_NAME}:${GITHUB_SHA}" |
+            jq -e '([.manifests[].platform | "\(.os)/\(.architecture)"] | sort) == ["linux/amd64","linux/arm64"]'
+          # A rerun of an older commit may publish its SHA without moving latest backwards.
+          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [ "$main_sha" = "$GITHUB_SHA" ]; then
+            docker buildx imagetools create --tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}:${GITHUB_SHA}"
+            docker buildx imagetools inspect "${IMAGE_NAME}:latest"
+          fi
